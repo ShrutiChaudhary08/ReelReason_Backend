@@ -1,0 +1,6 @@
+{
+  "name": "ReelReason Backend API & Studio",
+  "description": "Production-grade backend and AI systems architecture for ReelReason: AI-powered long-video to purposeful 9:16 vertical reels with explainable reasoning.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

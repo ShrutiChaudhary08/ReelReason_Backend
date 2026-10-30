@@ -1,0 +1,1110 @@
+Act as a senior backend engineer and AI systems architect.
+
+Build the complete backend for a hackathon project called **ReelReason**.
+
+ReelReason is an AI-powered web application that turns long videos—podcasts, lectures, interviews, webinars, and presentations—into purposeful, ready-to-post vertical reels.
+
+Unlike ordinary AI clippers, ReelReason does not simply extract random clips. It understands the creator’s audience, platform, goal, and tone; transcribes the video; analyzes the transcript; selects meaningful and diverse clips; explains why each clip was selected; generates hooks, captions, hashtags, and target-audience recommendations; and sends structured clip data to a rendering service for 9:16 vertical reel creation.
+
+The product’s core positioning is:
+
+> **ReelReason: From hours of content to reels worth watching.**
+
+> **ReelReason does not just find clips—it decides which stories deserve to be told, and explains why.**
+
+## Primary backend objective
+
+Build a production-quality backend that supports this exact flow:
+
+1. User uploads a long video or submits a YouTube link.
+2. User provides creator context:
+   - Platform: Instagram Reels, YouTube Shorts, TikTok, LinkedIn
+   - Audience: Students, Founders, Developers, Creators, General audience
+   - Goal: Views, Followers, Leads, Authority, Education
+   - Tone: Professional, Bold, Funny, Educational, Motivational
+   - Preferred clip types: Opinion, Lesson, Story, Emotion, Humor
+   - Number of clips: 3, 5, or 7
+   - Language: English, Hindi, Hinglish
+3. Backend stores the project and video.
+4. Backend extracts audio.
+5. Backend transcribes audio with word/segment-level timestamps.
+6. Backend cleans and splits the transcript into semantic segments.
+7. Backend analyzes each segment using an LLM.
+8. Backend selects 3–7 diverse, high-potential clips.
+9. Backend generates for each clip:
+   - Start and end timestamp
+   - Clip type
+   - Hook
+   - Title
+   - Caption
+   - Hashtags
+   - Target audience
+   - Reasoning: “Why this clip?”
+   - Scores: hook strength, clarity, audience fit, shareability, overall score
+10. Backend saves clip suggestions in Supabase.
+11. User can edit clip metadata.
+12. User can request rendering for a selected clip.
+13. Backend sends structured data to the Remotion renderer.
+14. Backend tracks render status.
+15. Backend stores and returns the final rendered MP4 URL.
+16. User can download the final reel.
+
+## Tech stack
+
+Use:
+
+- Python 3.10+
+- FastAPI
+- Supabase for:
+  - PostgreSQL database
+  - Authentication
+  - File storage
+  - Realtime subscriptions, if useful
+- Supabase Python client
+- Uvicorn
+- Pydantic
+- Pydantic Settings
+- python-dotenv
+- FFmpeg for audio extraction and video trimming
+- OpenAI Whisper API or AssemblyAI for transcription
+- OpenAI GPT or Google Gemini for clip reasoning
+- Remotion renderer as a separate Node.js service
+- Render or Railway for backend deployment
+
+## Supabase usage
+
+Use Supabase as the central backend infrastructure.
+
+### Supabase database
+
+Use PostgreSQL tables for:
+
+- Users
+- Video projects
+- Transcripts
+- Transcript segments
+- Clip suggestions
+- Rendered reels
+- User feedback
+- System/job logs
+
+### Supabase storage
+
+Create these buckets:
+
+- `reelreason-videos`
+  - Stores original uploaded videos.
+- `reelreason-audio`
+  - Stores extracted audio files.
+- `reelreason-rendered`
+  - Stores final rendered MP4 reels.
+- `reelreason-thumbnails`
+  - Stores thumbnails and preview images.
+
+Apply appropriate storage policies:
+- Authenticated users can upload to their own project folders.
+- Users can read only their own files.
+- Service role can manage files for backend processing.
+- Rendered reels should be readable by the project owner.
+
+### Supabase auth
+
+Use Supabase Auth for:
+
+- Email/password authentication
+- Google OAuth, if feasible
+- JWT validation in FastAPI
+- User-specific data access
+
+For the hackathon MVP, authentication can be simple, but the backend must be designed so every project, transcript, clip, and reel belongs to a specific user.
+
+## Database schema
+
+Create the following PostgreSQL tables in Supabase.
+
+### users
+
+```sql
+create table public.users (
+  id uuid primary key references auth.users(id) on delete cascade,
+  name text,
+  email text,
+  avatar_url text,
+  default_platform text,
+  default_audience text,
+  default_tone text,
+  preferred_clip_types text[],
+  clips_per_video int default 3,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+```
+
+### video_projects
+
+```sql
+create table public.video_projects (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references public.users(id) on delete cascade,
+  title text,
+  source_type text not null check (source_type in ('upload', 'youtube')),
+  source_url text,
+  video_path text,
+  audio_path text,
+  duration_seconds int,
+  language text default 'English',
+  platform text,
+  audience text,
+  goal text,
+  tone text,
+  preferred_clip_types text[],
+  number_of_clips int default 3,
+  status text not null default 'uploaded'
+    check (status in (
+      'uploaded',
+      'extracting_audio',
+      'transcribing',
+      'analyzing',
+      'ranking_clips',
+      'generating_reels',
+      'completed',
+      'failed'
+    )),
+  error_message text,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+```
+
+### transcripts
+
+```sql
+create table public.transcripts (
+  id uuid primary key default gen_random_uuid(),
+  project_id uuid not null references public.video_projects(id) on delete cascade,
+  provider text,
+  language text,
+  full_text text,
+  word_timestamps jsonb,
+  segment_timestamps jsonb,
+  created_at timestamptz default now()
+);
+```
+
+### transcript_segments
+
+```sql
+create table public.transcript_segments (
+  id uuid primary key default gen_random_uuid(),
+  transcript_id uuid not null references public.transcripts(id) on delete cascade,
+  project_id uuid not null references public.video_projects(id) on delete cascade,
+  start_time numeric not null,
+  end_time numeric not null,
+  text text not null,
+  summary text,
+  speaker text,
+  segment_index int,
+  created_at timestamptz default now()
+);
+```
+
+### clip_suggestions
+
+```sql
+create table public.clip_suggestions (
+  id uuid primary key default gen_random_uuid(),
+  project_id uuid not null references public.video_projects(id) on delete cascade,
+  segment_id uuid references public.transcript_segments(id) on delete set null,
+  start_time numeric not null,
+  end_time numeric not null,
+  duration_seconds int,
+  clip_type text not null
+    check (clip_type in (
+      'strong_opinion',
+      'practical_lesson',
+      'story',
+      'emotional_moment',
+      'contrarian_take',
+      'insight',
+      'humor'
+    )),
+  hook text not null,
+  title text not null,
+  caption text not null,
+  hashtags text[] default '{}',
+  target_audience text,
+  reasoning text not null,
+  hook_strength int,
+  clarity int,
+  audience_fit int,
+  shareability int,
+  overall_score int,
+  confidence numeric,
+  status text not null default 'suggested'
+    check (status in (
+      'suggested',
+      'approved',
+      'rejected',
+      'edited',
+      'rendering',
+      'rendered',
+      'failed'
+    )),
+  posting_order int,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+```
+
+### rendered_reels
+
+```sql
+create table public.rendered_reels (
+  id uuid primary key default gen_random_uuid(),
+  clip_id uuid not null references public.clip_suggestions(id) on delete cascade,
+  project_id uuid not null references public.video_projects(id) on delete cascade,
+  user_id uuid not null references public.users(id) on delete cascade,
+  render_status text not null default 'queued'
+    check (render_status in (
+      'queued',
+      'processing',
+      'completed',
+      'failed'
+    )),
+  renderer_job_id text,
+  video_path text,
+  video_url text,
+  thumbnail_path text,
+  thumbnail_url text,
+  subtitle_path text,
+  subtitle_url text,
+  aspect_ratio text default '9:16',
+  error_message text,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+```
+
+### clip_feedback
+
+```sql
+create table public.clip_feedback (
+  id uuid primary key default gen_random_uuid(),
+  clip_id uuid not null references public.clip_suggestions(id) on delete cascade,
+  user_id uuid not null references public.users(id) on delete cascade,
+  feedback_type text not null
+    check (feedback_type in (
+      'approved',
+      'rejected',
+      'edited',
+      'rendered',
+      'downloaded'
+    )),
+  notes text,
+  created_at timestamptz default now()
+);
+```
+
+### job_logs
+
+```sql
+create table public.job_logs (
+  id uuid primary key default gen_random_uuid(),
+  project_id uuid references public.video_projects(id) on delete cascade,
+  job_type text not null,
+  status text not null,
+  message text,
+  metadata jsonb,
+  created_at timestamptz default now()
+);
+```
+
+## Row Level Security
+
+Enable Row Level Security on every user-owned table.
+
+Implement policies so that:
+
+- Users can read only their own projects, transcripts, segments, clips, reels, feedback, and logs.
+- Users can create projects only for themselves.
+- Users can update only their own projects and clips.
+- Users cannot read or modify another user’s data.
+- Backend service-role operations can bypass RLS securely for processing tasks.
+
+Example policy pattern:
+
+```sql
+alter table public.video_projects enable row level security;
+
+create policy "Users can view own projects"
+on public.video_projects
+for select
+using (auth.uid() = user_id);
+
+create policy "Users can insert own projects"
+on public.video_projects
+for insert
+with check (auth.uid() = user_id);
+
+create policy "Users can update own projects"
+on public.video_projects
+for update
+using (auth.uid() = user_id);
+
+create policy "Users can delete own projects"
+on public.video_projects
+for delete
+using (auth.uid() = user_id);
+```
+
+Apply similar policies to:
+
+- transcripts
+- transcript_segments
+- clip_suggestions
+- rendered_reels
+- clip_feedback
+- job_logs
+
+## API endpoints
+
+Build these FastAPI endpoints.
+
+### Project endpoints
+
+```http
+POST /api/projects
+```
+
+- Accepts video upload or YouTube URL.
+- Accepts creator context.
+- Creates a new video project.
+- Uploads the video to Supabase Storage.
+- Starts background processing.
+- Returns project ID and initial status.
+
+```http
+GET /api/projects
+```
+
+- Returns all projects belonging to the authenticated user.
+
+```http
+GET /api/projects/{project_id}
+```
+
+- Returns one project’s details.
+- Ensures the project belongs to the authenticated user.
+
+```http
+DELETE /api/projects/{project_id}
+```
+
+- Deletes the project and associated data.
+- Optionally deletes associated Supabase Storage files.
+
+### Processing endpoints
+
+```http
+POST /api/projects/{project_id}/analyze
+```
+
+- Starts the full processing pipeline.
+- Updates project status.
+- Runs audio extraction, transcription, segmentation, and clip analysis in the background.
+
+```http
+GET /api/projects/{project_id}/status
+```
+
+- Returns:
+  - Current status
+  - Progress percentage
+  - Current pipeline step
+  - Error message, if any
+  - Estimated time remaining
+
+Possible statuses:
+
+```text
+uploaded
+extracting_audio
+transcribing
+analyzing
+ranking_clips
+generating_reels
+completed
+failed
+```
+
+### Transcript endpoints
+
+```http
+GET /api/projects/{project_id}/transcript
+```
+
+- Returns full transcript.
+- Returns timestamped segments.
+- Allows the frontend to display the transcript.
+
+### Clip endpoints
+
+```http
+GET /api/projects/{project_id}/clips
+```
+
+- Returns all clip suggestions for the project.
+- Supports filtering by clip type and status.
+- Supports sorting by overall score, duration, or timestamp.
+
+```http
+GET /api/clips/{clip_id}
+```
+
+- Returns one clip suggestion.
+- Includes reasoning and all generated metadata.
+
+```http
+PATCH /api/clips/{clip_id}
+```
+
+- Allows user to edit:
+  - Hook
+  - Title
+  - Caption
+  - Hashtags
+  - Start time
+  - End time
+  - Clip type
+  - Target audience
+  - Subtitle style
+  - Status
+
+```http
+POST /api/clips/{clip_id}/approve
+```
+
+- Marks clip as approved.
+
+```http
+POST /api/clips/{clip_id}/reject
+```
+
+- Marks clip as rejected.
+
+```http
+POST /api/clips/{clip_id}/regenerate-hook
+```
+
+- Generates alternative hooks using the LLM.
+
+```http
+POST /api/clips/{clip_id}/regenerate-caption
+```
+
+- Regenerates caption and hashtags using the LLM.
+
+### Rendering endpoints
+
+```http
+POST /api/clips/{clip_id}/render
+```
+
+- Validates that the clip belongs to the user.
+- Creates a rendered_reels record with status `queued`.
+- Sends structured render job data to the Remotion renderer.
+- Returns render job ID.
+
+```http
+GET /api/reels/{reel_id}
+```
+
+- Returns render status.
+- Returns final MP4 URL when completed.
+- Returns error message if rendering failed.
+
+```http
+GET /api/reels/{reel_id}/download
+```
+
+- Returns a secure download URL or redirects to the stored MP4.
+
+```http
+GET /api/projects/{project_id}/reels
+```
+
+- Returns all rendered reels for the project.
+
+### Feedback endpoints
+
+```http
+POST /api/clips/{clip_id}/feedback
+```
+
+- Records user feedback:
+  - Approved
+  - Rejected
+  - Edited
+  - Rendered
+  - Downloaded
+
+This feedback can later be used to improve clip-ranking quality.
+
+## Backend pipeline
+
+Implement the processing pipeline in this order:
+
+```text
+1. Receive video upload or YouTube URL
+2. Create project record
+3. Upload original video to Supabase Storage
+4. Update status: extracting_audio
+5. Extract audio using FFmpeg
+6. Upload audio to Supabase Storage
+7. Update status: transcribing
+8. Send audio to Whisper or AssemblyAI
+9. Save transcript with timestamps
+10. Clean transcript
+11. Split transcript into semantic segments
+12. Save segments
+13. Update status: analyzing
+14. Analyze segments using LLM
+15. Score and rank segments
+16. Update status: ranking_clips
+17. Select diverse final clips
+18. Generate hooks, captions, hashtags, reasoning, and scores
+19. Save clip suggestions
+20. Update status: generating_reels
+21. Prepare clip metadata for renderer
+22. Update status: completed
+```
+
+If any step fails:
+
+- Update project status to `failed`.
+- Save a meaningful error message.
+- Log the failure in `job_logs`.
+- Allow the user to retry analysis.
+
+## Transcription service
+
+Create a transcription service with a provider abstraction:
+
+```text
+TranscriptionProvider
+├── OpenAIWhisperProvider
+└── AssemblyAIProvider
+```
+
+Requirements:
+
+- Accept audio file or audio URL.
+- Return:
+  - Full transcript
+  - Language
+  - Word-level timestamps, if available
+  - Segment-level timestamps
+- Handle long audio by chunking if required.
+- Retry transient API failures.
+- Store raw provider response metadata if useful.
+
+Whisper-style transcription APIs can return structured word or segment timestamps, which are necessary for accurate clipping and subtitles.
+
+## Transcript processing
+
+After transcription:
+
+1. Remove filler words such as “um,” “uh,” “like,” and repeated words.
+2. Merge very short segments.
+3. Split transcript into semantic segments based on:
+   - Sentence boundaries
+   - Topic shifts
+   - Speaker changes, if available
+   - Natural pause lengths
+   - Maximum and minimum clip duration
+4. Generate a short summary for each segment.
+5. Save cleaned segments in `transcript_segments`.
+
+Target clip duration:
+
+```text
+Minimum: 20 seconds
+Ideal: 30–60 seconds
+Maximum: 90 seconds
+```
+
+## LLM clip-analysis engine
+
+Create a dedicated clip-analysis service.
+
+The LLM must receive:
+
+- Cleaned transcript segments with timestamps
+- Creator context:
+  - Platform
+  - Audience
+  - Goal
+  - Tone
+  - Preferred clip types
+  - Number of clips
+- Instructions to avoid incomplete thoughts, filler content, intros, and repeated ideas
+
+The LLM must return structured JSON.
+
+### Clip-analysis prompt
+
+Use this prompt:
+
+```text
+You are ReelReason, an expert short-form content strategist.
+
+You will receive:
+1. A timestamped transcript from a long video.
+2. Creator context: platform, audience, goal, preferred tone, and preferred clip types.
+
+Task:
+Identify exactly {number_of_clips} high-potential short-form clips.
+
+Rules:
+- Each clip must be understandable without watching the full video.
+- Each clip must have a strong hook in the first 2 seconds.
+- Do not select incomplete thoughts, introductions, filler content, or repeated ideas.
+- Return diverse clip types, such as strong opinion, practical lesson, story, emotional moment, contrarian take, insight, or humor.
+- For every clip, explain why it was selected.
+- Adapt the hook and caption to the creator’s audience, platform, goal, and tone.
+- Ensure clips do not overlap or repeat the same core idea.
+- Return only valid JSON.
+
+Return JSON in this exact format:
+
+{
+  "clips": [
+    {
+      "start": "MM:SS",
+      "end": "MM:SS",
+      "clip_type": "strong_opinion | practical_lesson | story | emotional_moment | contrarian_take | insight | humor",
+      "hook": "string",
+      "title": "string",
+      "caption": "string",
+      "hashtags": ["string"],
+      "target_audience": "string",
+      "reason": "string",
+      "hook_strength": 0-100,
+      "clarity": 0-100,
+      "audience_fit": 0-100,
+      "shareability": 0-100,
+      "overall_score": 0-100,
+      "confidence": 0-100,
+      "posting_order": 1
+    }
+  ]
+}
+```
+
+### Clip-selection scoring
+
+Calculate or validate an overall score using:
+
+```text
+overall_score =
+  0.30 * hook_strength
++ 0.25 * clarity
++ 0.20 * audience_fit
++ 0.15 * shareability
++ 0.10 * confidence
+```
+
+Also apply penalty rules:
+
+- Penalize clips that start slowly.
+- Penalize incomplete thoughts.
+- Penalize repeated ideas.
+- Penalize clips longer than 90 seconds.
+- Penalize clips without a clear payoff.
+- Penalize clips that do not match the creator’s preferred clip types.
+
+## Clip diversity logic
+
+Ensure the final clip set is diverse.
+
+For 3 clips, ideally return:
+
+```text
+1 strong opinion
+1 practical lesson
+1 story or emotional moment
+```
+
+For 5 clips, ideally return:
+
+```text
+1 strong opinion
+1 practical lesson
+1 story
+1 emotional moment
+1 contrarian take or insight
+```
+
+For 7 clips, add:
+
+```text
+1 humor clip
+1 additional insight or lesson
+```
+
+Implement duplicate-idea detection:
+
+- Compare clip summaries or embeddings.
+- If two clips have high semantic similarity, keep the higher-scoring one.
+- Do not return multiple clips from the same core idea.
+
+## Hook and caption generation
+
+Create separate LLM utilities for:
+
+- Regenerating hooks
+- Regenerating captions
+- Generating alternative hooks
+- Adapting copy for platform and audience
+
+For each clip, generate:
+
+- 1 primary hook
+- 3 alternative hooks
+- 1 title
+- 1 caption
+- 5–10 hashtags
+- 1 target-audience description
+- 1 recommended posting position
+
+Example output:
+
+```json
+{
+  "primary_hook": "Most creators edit for hours but choose the wrong moments.",
+  "alternative_hooks": [
+    "Stop editing randomly—use this 3-question test.",
+    "The fastest way to find a reel inside a long video.",
+    "Most creators waste hours choosing the wrong clip."
+  ],
+  "title": "The 3-question test before posting a reel",
+  "caption": "Stop clipping randomly. Ask these three questions before turning any long video into a reel.",
+  "hashtags": ["#contentcreation", "#reels", "#creatoreconomy", "#videoediting"],
+  "target_audience": "Beginner content creators and students",
+  "posting_order": 2
+}
+```
+
+## Renderer integration
+
+Create a renderer integration service.
+
+The backend should send this JSON to the Remotion renderer:
+
+```json
+{
+  "render_job_id": "render_123",
+  "clip_id": "clip_123",
+  "project_id": "project_123",
+  "video_url": "[https://supabase-storage-url/video.mp4](https://supabase-storage-url/video.mp4)",
+  "start_time": "02:14",
+  "end_time": "03:02",
+  "aspect_ratio": "9:16",
+  "hook": "Most creators edit for hours but choose the wrong moments.",
+  "title": "The 3-question test before posting a reel",
+  "caption": "Stop clipping randomly.",
+  "hashtags": ["#contentcreation", "#reels"],
+  "creator_handle": "@yourhandle",
+  "subtitle_style": {
+    "font": "Inter",
+    "font_size": 42,
+    "color": "#FFFFFF",
+    "highlight_color": "#7C3AED",
+    "position": "bottom"
+  },
+  "word_timestamps": [
+    {
+      "word": "Most",
+      "start": 134.2,
+      "end": 134.5
+    }
+  ]
+}
+```
+
+The renderer should:
+
+- Download or access the source video.
+- Trim the selected timestamp.
+- Reframe to 9:16.
+- Add animated subtitles.
+- Add hook overlay.
+- Add creator handle and optional watermark.
+- Render MP4.
+- Upload final MP4 to Supabase Storage.
+- Notify the backend or update the render record.
+
+The backend must track:
+
+```text
+queued → processing → completed
+```
+
+or
+
+```text
+queued → processing → failed
+```
+
+## Error handling and resilience
+
+Implement robust error handling:
+
+- Validate all incoming request data using Pydantic.
+- Return meaningful HTTP status codes:
+  - 400 for bad requests
+  - 401 for unauthorized access
+  - 403 for forbidden access
+  - 404 for missing resources
+  - 409 for conflicting operations
+  - 422 for validation errors
+  - 500 for internal errors
+- Retry transient transcription, LLM, storage, and renderer failures.
+- Add timeouts for external API calls.
+- Log every major pipeline step in `job_logs`.
+- Never expose internal stack traces or provider keys in API responses.
+- If the LLM returns invalid JSON, retry with a stricter prompt or repair the JSON.
+- If transcription fails, allow the user to retry.
+- If rendering fails, allow the user to retry rendering only.
+
+## Security requirements
+
+Implement strong security practices:
+
+- Validate JWTs from Supabase Auth.
+- Ensure every project, transcript, clip, and reel belongs to the authenticated user.
+- Enable and test Row Level Security.
+- Never commit `.env` files or real API keys.
+- Use `.env.example` files for required configuration.
+- Store secrets only in environment variables.
+- Do not store OTPs, passwords, UPI PINs, or card details.
+- Sanitize user-submitted text before sending it to external APIs.
+- Limit file types and file size.
+- Use signed URLs or controlled access for private media.
+- Rate-limit expensive endpoints such as analyze and render.
+
+## Environment variables
+
+Create `backend/.env.example`:
+
+```env
+# App
+APP_NAME=ReelReason API
+ENVIRONMENT=development
+FRONTEND_URL=http://localhost:5173
+
+# Supabase
+SUPABASE_URL=your_supabase_project_url
+SUPABASE_ANON_KEY=your_supabase_anon_key
+SUPABASE_SERVICE_ROLE_KEY=your_supabase_service_role_key
+SUPABASE_JWT_SECRET=your_supabase_jwt_secret
+
+# Storage buckets
+SUPABASE_VIDEO_BUCKET=reelreason-videos
+SUPABASE_AUDIO_BUCKET=reelreason-audio
+SUPABASE_RENDERED_BUCKET=reelreason-rendered
+SUPABASE_THUMBNAIL_BUCKET=reelreason-thumbnails
+
+# AI providers
+AI_PROVIDER=openai
+OPENAI_API_KEY=your_openai_api_key
+GEMINI_API_KEY=your_gemini_api_key
+
+# Transcription
+TRANSCRIPTION_PROVIDER=openai
+OPENAI_WHISPER_MODEL=whisper-1
+ASSEMBLYAI_API_KEY=your_assemblyai_api_key
+
+# Renderer
+RENDERER_BASE_URL=http://localhost:3000
+RENDERER_API_KEY=your_renderer_api_key
+
+# Processing
+MAX_VIDEO_SIZE_MB=500
+MAX_VIDEO_DURATION_MINUTES=15
+MIN_CLIP_DURATION_SECONDS=20
+MAX_CLIP_DURATION_SECONDS=90
+```
+
+## Backend folder structure
+
+Use this structure:
+
+```text
+backend/
+├── app/
+│   ├── main.py
+│   ├── config.py
+│   ├── dependencies.py
+│   ├── routes/
+│   │   ├── projects.py
+│   │   ├── transcripts.py
+│   │   ├── clips.py
+│   │   ├── reels.py
+│   │   ├── feedback.py
+│   │   └── users.py
+│   ├── services/
+│   │   ├── supabase_service.py
+│   │   ├── auth_service.py
+│   │   ├── storage_service.py
+│   │   ├── transcription_service.py
+│   │   ├── transcript_processing_service.py
+│   │   ├── clip_analysis_service.py
+│   │   ├── clip_selection_service.py
+│   │   ├── hook_caption_service.py
+│   │   ├── renderer_service.py
+│   │   ├── pipeline_service.py
+│   │   └── feedback_service.py
+│   ├── models/
+│   │   ├── project_models.py
+│   │   ├── transcript_models.py
+│   │   ├── clip_models.py
+│   │   ├── reel_models.py
+│   │   ├── user_models.py
+│   │   └── common_models.py
+│   ├── prompts/
+│   │   ├── clip_analysis.txt
+│   │   ├── hook_generation.txt
+│   │   ├── caption_generation.txt
+│   │   └── alternative_hooks.txt
+│   ├── utils/
+│   │   ├── ffmpeg_utils.py
+│   │   ├── time_utils.py
+│   │   ├── text_utils.py
+│   │   ├── json_utils.py
+│   │   └── validators.py
+│   └── workers/
+│       ├── analyze_worker.py
+│       └── render_worker.py
+├── tests/
+│   ├── test_projects.py
+│   ├── test_clips.py
+│   ├── test_pipeline.py
+│   └── test_security.py
+├── requirements.txt
+├── .env.example
+├── .gitignore
+└── README.md
+## Mock mode requirement
+
+Create a mock/demo mode so the backend can be tested without spending API credits.
+
+When `AI_PROVIDER=mock` or `ENVIRONMENT=demo`:
+
+- Skip real transcription.
+- Use a sample transcript.
+- Return predefined clip suggestions.
+- Simulate processing delays.
+- Return a sample rendered MP4 URL.
+- Allow the frontend and renderer teams to integrate without waiting for real APIs.
+
+This is important for hackathon development and demo reliability.
+
+## Testing requirements
+
+Write tests for:
+
+- Project creation
+- Authentication and authorization
+- Supabase RLS behavior
+- Transcript storage
+- Clip suggestion creation
+- Clip editing
+- Render job creation
+- Render status updates
+- Error handling
+- Invalid LLM JSON handling
+- Duplicate clip detection
+- Clip diversity logic
+- API response schemas
+
+Use:
+
+- pytest
+- httpx
+- FastAPI TestClient
+
+## Hackathon judging alignment
+
+Design the backend to visibly support these judging criteria:
+
+### Innovation & creativity
+- Explainable clip reasoning.
+- Audience-aware clip selection.
+- Content-angle diversity.
+- Alternative hook generation.
+- Posting-order recommendation.
+
+### Relevance to problem statement
+- Directly solves long-form video repurposing.
+- Reduces manual clip hunting.
+- Converts one long video into multiple strategic reels.
+
+### Technical implementation
+- Modular services.
+- Structured LLM outputs.
+- Timestamped transcription.
+- Semantic segmentation.
+- Background processing.
+- Renderer integration.
+- Secure Supabase RLS.
+
+### UI/UX & presentation
+- Fast status updates.
+- Clear pipeline stages.
+- Meaningful error messages.
+- Reliable API responses for smooth frontend experience.
+
+### Real-world impact
+- Saves creators hours of manual review.
+- Makes long-form content reusable.
+- Supports educators, coaches, founders, and businesses.
+
+### Scalability & feasibility
+- Provider abstraction for transcription and AI.
+- Modular pipeline.
+- Background jobs.
+- Supabase-backed storage and database.
+- Clear MVP limits and future expansion path.
+
+## Deliverables
+
+Provide:
+
+1. Complete backend folder structure.
+2. `requirements.txt`.
+3. FastAPI application setup.
+4. Supabase integration.
+5. Complete SQL schema.
+6. Row Level Security policies.
+7. Supabase Storage bucket setup and policies.
+8. Authentication and JWT validation.
+9. All API endpoints.
+10. Pydantic models.
+11. Transcription service.
+12. Transcript processing service.
+13. LLM clip-analysis service.
+14. Clip-selection and diversity logic.
+15. Hook/caption generation service.
+16. Renderer integration service.
+17. Background processing pipeline.
+18. Error handling and logging.
+19. Mock/demo mode.
+20. Tests.
+21. `.env.example`.
+22. `.gitignore`.
+23. README with local setup instructions.
+24. Clear API documentation for frontend and renderer teams.
+
+Make the backend modular, secure, reliable, and demo-ready. Prioritize a smooth end-to-end flow: upload → transcribe → analyze → explain → edit → render → export.
+```
